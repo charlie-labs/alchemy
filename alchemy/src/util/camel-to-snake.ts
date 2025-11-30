@@ -14,7 +14,11 @@ export function camelToSnakeObjectDeep<T extends object | undefined>(
               .replace(/([a-z])([A-Z])/g, "$1_$2") // Handle normal camelCase: "fooBar" -> "foo_Bar"
               .toLowerCase(),
             Array.isArray(value)
-              ? value.map(camelToSnakeObjectDeep)
+              ? value.map((element) =>
+                  typeof element === "object" && element !== null
+                    ? camelToSnakeObjectDeep(element)
+                    : element,
+                )
               : typeof value === "object" && value !== null
                 ? camelToSnakeObjectDeep(value)
                 : value,
