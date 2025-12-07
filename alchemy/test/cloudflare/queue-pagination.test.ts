@@ -60,7 +60,9 @@ describe("Cloudflare queue pagination", () => {
     expect(result?.result?.queue_id).toBe("3");
     expect(get).toHaveBeenCalledTimes(3);
 
-    const firstCallUrl = new URL(`https://example.com${get.mock.calls[0][0] as string}`);
+    const firstCallUrl = new URL(
+      `https://example.com${get.mock.calls[0][0] as string}`,
+    );
     expect(firstCallUrl.searchParams.get("page")).toBe("1");
     expect(firstCallUrl.searchParams.get("per_page")).toBe("100");
 
@@ -72,7 +74,10 @@ describe("Cloudflare queue pagination", () => {
 
   it("returns all queues across paginated responses", async () => {
     const { api, get } = createMockApi([
-      { result: [createQueue("page-one", "1")], result_info: { total_pages: 2 } },
+      {
+        result: [createQueue("page-one", "1")],
+        result_info: { total_pages: 2 },
+      },
       { result: [createQueue("page-two", "2")] },
     ]);
 
@@ -87,7 +92,10 @@ describe("Cloudflare queue pagination", () => {
 
   it("stops pagination when a queue is not found", async () => {
     const { api, get } = createMockApi([
-      { result: [createQueue("page-one", "1")], result_info: { total_pages: 2 } },
+      {
+        result: [createQueue("page-one", "1")],
+        result_info: { total_pages: 2 },
+      },
       { result: [] },
     ]);
 
