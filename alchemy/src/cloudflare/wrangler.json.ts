@@ -10,7 +10,7 @@ import { createCloudflareApi } from "./api.ts";
 import type { Bindings } from "./bindings.ts";
 import { getCloudflareRegistryWithAccountNamespace } from "./container.ts";
 import type { DurableObjectNamespace } from "./durable-object-namespace.ts";
-import type { EventSource } from "./event-source.ts";
+import type { EventSource, WorkerEventSource } from "./event-source.ts";
 import { isQueueEventSource } from "./event-source.ts";
 import { isQueue } from "./queue.ts";
 import { unencryptSecrets } from "./util/filter-env-bindings.ts";
@@ -249,7 +249,7 @@ export interface WranglerJsonSpec extends Partial<WranglerJsonConfig> {}
 async function processBindings(
   spec: WranglerJsonSpec,
   bindings: Bindings,
-  eventSources: EventSource[] | undefined,
+  eventSources: Array<EventSource | WorkerEventSource> | undefined,
   workerName: string,
   workerCwd: string,
   writeSecrets: boolean,
