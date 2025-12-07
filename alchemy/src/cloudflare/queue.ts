@@ -519,10 +519,7 @@ type CloudflareQueueListResponse = {
   errors?: Array<{ code: number; message: string }>;
   result?: CloudflareQueueListItem[];
   result_info?: {
-    page?: number;
     per_page?: number;
-    count?: number;
-    total_count?: number;
     total_pages?: number;
   };
 };
