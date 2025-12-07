@@ -1,7 +1,7 @@
 import type { Context } from "../context.ts";
 import { Resource, ResourceKind } from "../resource.ts";
 import { Scope } from "../scope.ts";
-import { handleApiError } from "./api-error.ts";
+import { CloudflareApiError, handleApiError } from "./api-error.ts";
 import {
   createCloudflareApi,
   type CloudflareApi,
