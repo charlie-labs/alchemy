@@ -21,6 +21,7 @@ import {
   R2BucketCustomDomain,
   type R2BucketCustomDomainOptions,
 } from "./bucket-custom-domain.ts";
+import type { BucketEventSource, BucketEventFilter } from "./event-source.ts";
 import { deleteMiniflareBinding } from "./miniflare/delete.ts";
 import { getDefaultPersistPath } from "./miniflare/paths.ts";
 
@@ -322,6 +323,10 @@ export type R2Bucket = _R2Bucket & {
   ): Promise<PutR2ObjectResponse>;
   delete(key: string): Promise<Response>;
   list(options?: R2ListOptions): Promise<R2Objects>;
+  object(
+    pattern: string,
+    options?: BucketEventSourceOptions,
+  ): BucketEventSource;
 };
 
 /**
@@ -407,6 +412,37 @@ type _R2Bucket = Omit<
      */
     host: string;
   };
+};
+
+type BucketEventSourceOptions = Omit<BucketEventSource, "bucket" | "filter"> & {
+  filter?: BucketEventFilter;
+};
+
+const parseEventPattern = (pattern: string): BucketEventFilter => {
+  if (!pattern) {
+    return {};
+  }
+  const wildcardIndex = pattern.indexOf("*");
+  if (wildcardIndex === -1) {
+    return { prefix: pattern };
+  }
+  const prefix = pattern.slice(0, wildcardIndex);
+  const suffix = pattern.slice(wildcardIndex + 1) || undefined;
+  return {
+    prefix,
+    suffix,
+  };
+};
+
+const mergeBucketFilters = (
+  ...filters: Array<BucketEventFilter | undefined>
+): BucketEventFilter => {
+  return filters.reduce<BucketEventFilter>((acc, filter) => {
+    if (!filter) return acc;
+    if (filter.prefix) acc.prefix = filter.prefix;
+    if (filter.suffix) acc.suffix = filter.suffix;
+    return acc;
+  }, {});
 };
 
 export function isBucket(resource: any): resource is R2Bucket {
@@ -539,6 +575,23 @@ export async function R2Bucket(
         ...options,
         jurisdiction: bucket.jurisdiction,
       });
+    },
+    object: (pattern: string, options?: BucketEventSourceOptions) => {
+      const filter = mergeBucketFilters(
+        parseEventPattern(pattern),
+        options?.filter,
+      );
+      const normalizedFilter =
+        filter.prefix || filter.suffix ? filter : undefined;
+
+      return {
+        bucket: bucket as R2Bucket,
+        queue: options?.queue,
+        eventTypes: options?.eventTypes,
+        filter: normalizedFilter,
+        settings: options?.settings,
+        description: options?.description,
+      } satisfies BucketEventSource;
     },
     put: async (
       key: string,

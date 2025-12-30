@@ -17,6 +17,7 @@ export * from "./bound.ts";
 export * from "./browser-rendering.ts";
 export * from "./bucket-custom-domain.ts";
 export * from "./bucket-object.ts";
+export * from "./bucket-event-notification.ts";
 export * from "./bucket.ts";
 export * from "./bun-spa/bun-spa.ts";
 export * from "./certificate-pack.ts";

@@ -32,15 +32,28 @@ import {
   DurableObjectNamespace,
   isDurableObjectNamespace,
 } from "./durable-object-namespace.ts";
-import { type EventSource, isQueueEventSource } from "./event-source.ts";
+import type { R2Bucket } from "./bucket.ts";
+import {
+  type BucketEventFilter,
+  type BucketEventType,
+  type EventSource,
+  type WorkerEventSource,
+  isBucketEventSource,
+  isQueueEventSource,
+} from "./event-source.ts";
+import {
+  BucketEventNotification,
+  DEFAULT_BUCKET_EVENT_TYPES,
+} from "./bucket-event-notification.ts";
 import { deleteMiniflareWorkerData } from "./miniflare/delete.ts";
 import { MiniflareController } from "./miniflare/miniflare-controller.ts";
 import {
   QueueConsumer,
   deleteQueueConsumer,
   listQueueConsumersForWorker,
+  type QueueConsumerSettings,
 } from "./queue-consumer.ts";
-import { isQueue } from "./queue.ts";
+import { isQueue, Queue } from "./queue.ts";
 import { Route } from "./route.ts";
 import { type AssetUploadResult, uploadAssets } from "./worker-assets.ts";
 import {
@@ -62,6 +75,7 @@ import {
   isWorkflow,
   upsertWorkflow,
 } from "./workflow.ts";
+import { isBucket } from "./bucket.ts";
 
 // Previous versions of `Worker` used the `Bundle` resource.
 // This import is here to avoid errors when destroying the `Bundle` resource.
@@ -241,7 +255,7 @@ export interface BaseWorkerProps<
    *
    * Can include queues, streams, or other event sources.
    */
-  eventSources?: EventSource[];
+  eventSources?: WorkerEventSource[];
 
   /**
    * Routes to create for this worker.
@@ -542,7 +556,10 @@ export function isWorker(resource: any): resource is Worker<any> {
 export type Worker<
   B extends Bindings | undefined = Bindings | undefined,
   RPC extends Rpc.WorkerEntrypointBranded = Rpc.WorkerEntrypointBranded,
-> = Omit<WorkerProps<B>, "url" | "script" | "routes" | "domains"> & {
+> = Omit<
+  WorkerProps<B>,
+  "url" | "script" | "routes" | "domains" | "eventSources"
+> & {
   /** @internal phantom property */
   __rpc__?: RPC;
 
@@ -586,6 +603,8 @@ export type Worker<
    * The bindings that were created
    */
   bindings: B;
+
+  eventSources?: EventSource[];
 
   /**
    * Configuration for static assets
@@ -987,6 +1006,18 @@ const _Worker = Resource(
     const bundle = options.bundle.value;
     const api = await createCloudflareApi(props);
 
+    const resolvedEventSources = await resolveEventSources(
+      props.eventSources,
+      { ...props, adopt },
+      { local: this.scope.local },
+    );
+    const normalizedEventSources: EventSource[] = resolvedEventSources.map(
+      (eventSource) =>
+        eventSource.settings
+          ? { queue: eventSource.queue, settings: eventSource.settings }
+          : eventSource.queue,
+    );
+
     if (this.scope.local && !props.dev?.remote) {
       let url: string | undefined;
       if (props.dev?.url) {
@@ -1000,7 +1031,7 @@ const _Worker = Resource(
           compatibilityDate: options.compatibilityDate,
           compatibilityFlags: options.compatibilityFlags,
           bindings: props.bindings,
-          eventSources: props.eventSources,
+          eventSources: normalizedEventSources,
           assets: props.assets,
           bundle,
           port: props.dev?.port,
@@ -1014,6 +1045,7 @@ const _Worker = Resource(
         {
           ...props,
           adopt,
+          resolvedEventSources,
         },
         {
           name: options.name,
@@ -1032,6 +1064,7 @@ const _Worker = Resource(
         compatibilityFlags: options.compatibilityFlags,
         format: props.format || "esm",
         bindings: normalizeExportBindings(options.name, props.bindings),
+        eventSources: normalizedEventSources,
         createdAt: this.output?.createdAt ?? Date.now(),
         updatedAt: Date.now(),
         url,
@@ -1155,6 +1188,7 @@ const _Worker = Resource(
       {
         ...props,
         adopt,
+        resolvedEventSources,
       },
       {
         name: options.name,
@@ -1182,7 +1216,7 @@ const _Worker = Resource(
       observability: props.observability,
       createdAt: this.output?.createdAt ?? now,
       updatedAt: now,
-      eventSources: props.eventSources,
+      eventSources: normalizedEventSources,
       url: subdomain?.url,
       assets: props.assets,
       crons: props.crons,
@@ -1200,6 +1234,108 @@ const _Worker = Resource(
     } as unknown as Worker<B>;
   },
 );
+
+type ResolvedEventSource = {
+  queue: Queue;
+  settings?: QueueConsumerSettings;
+  bucket?: R2Bucket;
+  filter?: BucketEventFilter;
+  eventTypes?: BucketEventType[];
+  description?: string;
+};
+
+async function resolveEventSources<B extends Bindings>(
+  eventSources: WorkerEventSource[] | undefined,
+  props: WorkerProps<B> & CloudflareApiOptions & { adopt: boolean },
+  options: { local: boolean },
+): Promise<ResolvedEventSource[]> {
+  if (!eventSources?.length) {
+    return [];
+  }
+
+  return await Promise.all(
+    eventSources.map(async (eventSource) => {
+      if (isQueue(eventSource)) {
+        return {
+          queue: eventSource,
+          settings: eventSource.dlq
+            ? { deadLetterQueue: eventSource.dlq }
+            : undefined,
+        } satisfies ResolvedEventSource;
+      }
+
+      if (isQueueEventSource(eventSource)) {
+        return {
+          queue: eventSource.queue,
+          settings: eventSource.settings,
+        } satisfies ResolvedEventSource;
+      }
+
+      if (isBucketEventSource(eventSource)) {
+        const bucket = isBucket(eventSource) ? eventSource : eventSource.bucket;
+        const queue = await ensureBucketQueue(
+          eventSource,
+          bucket,
+          props,
+          options.local,
+        );
+
+        return {
+          queue,
+          settings: isBucket(eventSource) ? undefined : eventSource.settings,
+          bucket,
+          filter: isBucket(eventSource) ? undefined : eventSource.filter,
+          eventTypes: isBucket(eventSource)
+            ? undefined
+            : eventSource.eventTypes,
+          description: isBucket(eventSource)
+            ? undefined
+            : eventSource.description,
+        } satisfies ResolvedEventSource;
+      }
+
+      throw new Error("Unsupported event source provided to Worker");
+    }),
+  );
+}
+
+async function ensureBucketQueue<B extends Bindings>(
+  source: WorkerEventSource,
+  bucket: R2Bucket,
+  props: WorkerProps<B> & CloudflareApiOptions & { adopt: boolean },
+  local: boolean,
+): Promise<Queue> {
+  if (!isBucketEventSource(source)) {
+    throw new Error("ensureBucketQueue called with non-bucket event source");
+  }
+
+  const queueInput = isBucket(source) ? undefined : source.queue;
+  if (isQueue(queueInput)) {
+    return queueInput;
+  }
+
+  const queueName =
+    typeof queueInput === "string" && queueInput
+      ? queueInput
+      : `${bucket.name}-events`;
+
+  return await Queue(queueName, {
+    name: queueName,
+    adopt: props.adopt,
+    dev: local
+      ? {
+          remote: false,
+          force: true,
+        }
+      : undefined,
+    accountId: props.accountId,
+    apiKey: props.apiKey,
+    apiToken: props.apiToken,
+    email: props.email,
+    baseUrl: props.baseUrl,
+    profile: props.profile,
+  });
+}
 
 const normalizeExportBindings = (
   scriptName: string,
@@ -1240,6 +1376,7 @@ const assertUnique = <T, Key extends keyof T>(
 async function provisionResources<B extends Bindings>(
   props: WorkerProps<B> & {
     adopt: boolean;
+    resolvedEventSources: ResolvedEventSource[];
   },
   options:
     | {
@@ -1283,23 +1420,13 @@ async function provisionResources<B extends Bindings>(
         adopt: domain.adopt ?? props.adopt,
       };
     }),
-    eventSources: props.eventSources?.map((eventSource) => {
-      if (isQueue(eventSource)) {
-        return {
-          queue: eventSource,
-          settings: eventSource.dlq
-            ? { deadLetterQueue: eventSource.dlq }
-            : undefined,
-        };
-      }
-      if (isQueueEventSource(eventSource)) {
-        return {
-          queue: eventSource.queue,
-          settings: eventSource.settings,
-        };
-      }
-      throw new Error(`Unsupported event source: ${eventSource}`);
-    }),
+    eventSources:
+      props.resolvedEventSources.length > 0
+        ? props.resolvedEventSources.map((eventSource) => ({
+            queue: eventSource.queue,
+            settings: eventSource.settings,
+          }))
+        : undefined,
     routes: props.routes?.map((route) => {
       if (typeof route === "string") {
         return {
@@ -1330,74 +1457,106 @@ async function provisionResources<B extends Bindings>(
     assertUnique(input.domains, "name", "Custom Domain");
   }
 
-  const [containers, domains, eventSources, routes, subdomain] =
-    await Promise.all([
-      input.containers
-        ? Promise.all(
-            input.containers.map(async (container) => {
-              return await ContainerApplication(container.id, {
-                ...container,
-                durableObjects: {
-                  namespaceId: await getContainerNamespaceId(container),
-                },
-                dev: options.local,
-                ...input.api,
-              });
-            }),
-          )
-        : undefined,
-      input.domains
-        ? Promise.all(
-            input.domains.map(async (domain) => {
-              return await CustomDomain(domain.name, {
-                name: domain.name,
-                zoneId: domain.zoneId,
-                adopt: domain.adopt,
-                workerName: options.name,
-                dev: options.local,
-                ...input.api,
-              });
-            }),
-          )
-        : undefined,
-      input.eventSources
-        ? Promise.all(
-            input.eventSources.map(async (eventSource) => {
-              return await QueueConsumer(`${eventSource.queue.id}-consumer`, {
+  const bucketEventSources = props.resolvedEventSources.filter(
+    (eventSource) => eventSource.bucket,
+  );
+
+  const [
+    containers,
+    domains,
+    eventSources,
+    routes,
+    subdomain,
+    _bucketNotifications,
+  ] = await Promise.all([
+    input.containers
+      ? Promise.all(
+          input.containers.map(async (container) => {
+            return await ContainerApplication(container.id, {
+              ...container,
+              durableObjects: {
+                namespaceId: await getContainerNamespaceId(container),
+              },
+              dev: options.local,
+              ...input.api,
+            });
+          }),
+        )
+      : undefined,
+    input.domains
+      ? Promise.all(
+          input.domains.map(async (domain) => {
+            return await CustomDomain(domain.name, {
+              name: domain.name,
+              zoneId: domain.zoneId,
+              adopt: domain.adopt,
+              workerName: options.name,
+              dev: options.local,
+              ...input.api,
+            });
+          }),
+        )
+      : undefined,
+    input.eventSources
+      ? Promise.all(
+          input.eventSources.map(async (eventSource) => {
+            return await QueueConsumer(`${eventSource.queue.id}-consumer`, {
+              queue: eventSource.queue,
+              scriptName: options.name,
+              settings: eventSource.settings,
+              adopt: props.adopt,
+              dev: options.local,
+              ...input.api,
+            });
+          }),
+        )
+      : undefined,
+    input.routes
+      ? Promise.all(
+          input.routes.map(async (route) => {
+            return await Route(route.pattern, {
+              pattern: route.pattern,
+              script: options.name,
+              zoneId: route.zoneId,
+              adopt: route.adopt,
+              dev: options.local,
+              ...input.api,
+            });
+          }),
+        )
+      : undefined,
+    (props.url ?? !options.dispatchNamespace)
+      ? WorkerSubdomain("url", {
+          scriptName: options.name,
+          previewVersionId: props.version ? options.result?.id : undefined,
+          retain: !!props.version,
+          dev: options.local,
+          ...input.api,
+        })
+      : undefined,
+    bucketEventSources.length > 0
+      ? Promise.all(
+          bucketEventSources.map(async (eventSource) => {
+            return await BucketEventNotification(
+              `${eventSource.bucket?.name ?? options.name}-bucket-events-${eventSource.queue.name}`,
+              {
+                bucket: eventSource.bucket as R2Bucket,
                 queue: eventSource.queue,
-                scriptName: options.name,
-                settings: eventSource.settings,
+                eventTypes:
+                  eventSource.eventTypes ?? DEFAULT_BUCKET_EVENT_TYPES,
+                filter: eventSource.filter,
+                description: eventSource.description,
                 adopt: props.adopt,
                 dev: options.local,
                 ...input.api,
-              });
-            }),
-          )
-        : undefined,
-      input.routes
-        ? Promise.all(
-            input.routes.map(async (route) => {
-              return await Route(route.pattern, {
-                pattern: route.pattern,
-                script: options.name,
-                zoneId: route.zoneId,
-                adopt: route.adopt,
-                dev: options.local,
-                ...input.api,
-              });
-            }),
-          )
-        : undefined,
-      (props.url ?? !options.dispatchNamespace)
-        ? WorkerSubdomain("url", {
-            scriptName: options.name,
-            previewVersionId: props.version ? options.result?.id : undefined,
-            retain: !!props.version,
-            dev: options.local,
-            ...input.api,
-          })
-        : undefined,
-    ]);
+              },
+            );
+          }),
+        )
+      : undefined,
+  ]);
+
+  void _bucketNotifications;
 
   return { containers, domains, routes, eventSources, subdomain };
 
