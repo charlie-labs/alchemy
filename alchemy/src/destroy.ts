@@ -15,6 +15,7 @@ import type { State } from "./state.ts";
 import { formatFQN } from "./util/cli.ts";
 import { logger } from "./util/logger.ts";
 import { createAndSendEvent } from "./util/telemetry.ts";
+import { tryHandleCloudflareOrphanPruneError } from "./cloudflare/orphan-prune.ts";
 
 export function isDestroyedSignal(error: any): error is DestroyedSignal {
   return error instanceof Error && (error as any).kind === "DestroyedSignal";
@@ -34,6 +35,13 @@ export const DestroyStrategy = Symbol.for("alchemy::DestroyStrategy");
 export interface DestroyOptions {
   quiet?: boolean;
   strategy?: DestroyStrategy;
+  /**
+   * Marks this destroy pass as an orphan-pruning operation.
+   *
+   * When enabled, `destroyAll()` will run sequentially (even if `strategy` is
+   * `"parallel"`) so it can apply provider-specific ordering / retries.
+   */
+  pruneOrphans?: boolean;
   replace?: {
     props?: ResourceProps | undefined;
     output?: Resource<string>;
@@ -75,7 +83,7 @@ export async function destroy(
           ...orphan.output,
           Scope: scope,
         })),
-        options,
+        Object.assign({}, options, { pruneOrphans: true }),
       );
     });
 
@@ -266,15 +274,94 @@ export async function destroyAll(
   resources: Resource[],
   options?: DestroyOptions & { force?: boolean },
 ) {
-  if (options?.strategy !== "parallel") {
-    const sorted = resources.sort((a, b) => b[ResourceSeq] - a[ResourceSeq]);
-    for (const resource of sorted) {
+  const normalizedOptions = options?.pruneOrphans
+    ? { ...options, strategy: "sequential" as const }
+    : options;
+
+  const shouldRunSequential = normalizedOptions?.strategy !== "parallel";
+
+  if (!shouldRunSequential) {
+    // Ensure any scope-managed pending deletions are processed before kicking off
+    // a parallel destroy pass.
+    const pendingDeletions: Promise<unknown>[] = [];
+    for (const resource of resources) {
       if (isScope(resource)) {
-        await resource.destroyPendingDeletions();
+        pendingDeletions.push(resource.destroyPendingDeletions());
       }
-      await destroy(resource, options);
     }
-  } else {
-    await Promise.all(resources.map((resource) => destroy(resource, options)));
+    await Promise.all(pendingDeletions);
+    await Promise.all(
+      resources.map((resource) => destroy(resource, normalizedOptions)),
+    );
+    return;
+  }
+
+  const queue = resources
+    .slice()
+    .sort((a, b) => b[ResourceSeq] - a[ResourceSeq]);
+
+  const skippedKeys = new Set<string>();
+
+  const resourceKey = (resource: Resource): string => {
+    const fqn = resource?.[ResourceFQN];
+    if (typeof fqn === "string") {
+      return fqn;
+    }
+    const id = resource?.[ResourceID];
+    if (typeof id === "string") {
+      return id;
+    }
+
+    logger.warnOnce(
+      `destroyAll: Resource is missing both ${String(ResourceFQN)} and ${String(ResourceID)}; falling back to kind+seq key`,
+    );
+
+    const kind = resource?.[ResourceKind];
+    const seq = resource?.[ResourceSeq];
+    return `${typeof kind === "string" ? kind : "resource"}:${
+      typeof seq === "number" ? seq : "unknown"
+    }`;
+  };
+
+  for (let i = 0; i < queue.length; i++) {
+    const resource = queue[i];
+
+    const key = resourceKey(resource);
+    if (skippedKeys.has(key)) {
+      continue;
+    }
+
+    if (isScope(resource)) {
+      await resource.destroyPendingDeletions();
+    }
+
+    try {
+      await destroy(resource, normalizedOptions);
+    } catch (error) {
+      if (normalizedOptions?.pruneOrphans === true) {
+        try {
+          const result = await tryHandleCloudflareOrphanPruneError({
+            resource,
+            error,
+            remaining: queue.slice(i + 1),
+            destroy: (r, o) => destroy(r, o as DestroyOptions),
+            options: normalizedOptions,
+          });
+
+          if (result.handled) {
+            for (const key of result.skipKeys) {
+              skippedKeys.add(key);
+            }
+            continue;
+          }
+        } catch (handlerError) {
+          logger.warn("Orphan prune handler threw an error");
+          logger.warn(handlerError);
+          throw error;
+        }
+      }
+
+      throw error;
+    }
   }
 }

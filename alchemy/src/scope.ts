@@ -601,6 +601,8 @@ export class Scope {
       await destroyAll(orphans, {
         quiet: this.quiet,
         strategy: this.destroyStrategy,
+        // Forces sequential execution so provider-specific ordering / retries can be applied.
+        pruneOrphans: true,
         force: shouldForce,
         noop: options?.noop,
       });
