@@ -23,6 +23,7 @@ import {
 } from "./bucket-custom-domain.ts";
 import { deleteMiniflareBinding } from "./miniflare/delete.ts";
 import { getDefaultPersistPath } from "./miniflare/paths.ts";
+import type { Queue } from "./queue.ts";
 
 export type R2BucketJurisdiction = "default" | "eu" | "fedramp";
 
@@ -112,6 +113,12 @@ export interface BucketProps extends CloudflareApiOptions {
    * Lock rules for the bucket
    */
   lock?: R2BucketLockRule[];
+
+  /**
+   * Configure R2 bucket event notifications (Cloudflare Event Notifications) to
+   * one or more Cloudflare Queues.
+   */
+  eventNotifications?: R2BucketEventNotificationOptions[];
 
   /**
    * Enable data catalog for bucket
@@ -269,6 +276,61 @@ interface R2BucketCORSRule {
   maxAgeSeconds?: number;
 }
 
+export type R2BucketEventNotificationAction =
+  | "PutObject"
+  | "CopyObject"
+  | "DeleteObject"
+  | "CompleteMultipartUpload"
+  | "LifecycleDeletion";
+
+export interface R2BucketEventNotificationRuleOptions {
+  /**
+   * Events that should trigger notifications.
+   */
+  actions: R2BucketEventNotificationAction[];
+
+  /**
+   * Optional object key prefix filter.
+   */
+  prefix?: string;
+
+  /**
+   * Optional object key suffix filter.
+   */
+  suffix?: string;
+
+  /**
+   * Optional per-rule description.
+   */
+  description?: string;
+}
+
+export interface R2BucketEventNotificationOptions {
+  /**
+   * Target queue for the event notifications.
+   *
+   * Accepts either a Queue resource (preferred) or a raw queue ID.
+   */
+  queue: Queue | string;
+
+  /**
+   * One or more rules that should publish notifications to this queue.
+   */
+  rules: R2BucketEventNotificationRuleOptions[];
+}
+
+export interface R2BucketEventNotification {
+  /**
+   * The Cloudflare Queue ID.
+   */
+  queueId: string;
+
+  /**
+   * Rules for events that should be published to the queue.
+   */
+  rules: R2BucketEventNotificationRuleOptions[];
+}
+
 export type R2ObjectMetadata = {
   key: string;
   etag: string;
@@ -329,7 +391,7 @@ export type R2Bucket = _R2Bucket & {
  */
 type _R2Bucket = Omit<
   BucketProps,
-  "delete" | "dev" | "domains" | "devDomain"
+  "delete" | "dev" | "domains" | "devDomain" | "eventNotifications"
 > & {
   /**
    * Resource type identifier
@@ -407,6 +469,11 @@ type _R2Bucket = Omit<
      */
     host: string;
   };
+
+  /**
+   * Normalized event notifications configuration for this bucket.
+   */
+  eventNotifications?: R2BucketEventNotification[];
 };
 
 export function isBucket(resource: any): resource is R2Bucket {
@@ -613,6 +680,38 @@ const parseR2Object = (key: string, response: Response): R2ObjectContent => ({
 const parseDate = (headers: Headers) =>
   new Date(headers.get("Last-Modified") ?? headers.get("Date")!);
 
+function normalizeR2BucketEventNotifications(
+  eventNotifications: R2BucketEventNotificationOptions[],
+): R2BucketEventNotification[] {
+  const normalized = eventNotifications.map((notification) => {
+    const queueId =
+      typeof notification.queue === "string"
+        ? notification.queue
+        : notification.queue.id;
+    if (!queueId) {
+      throw new Error("Event notification queue must have an id");
+    }
+
+    return {
+      queueId,
+      rules: notification.rules,
+    } satisfies R2BucketEventNotification;
+  });
+
+  const seenQueueIds = new Set<string>();
+  for (const notification of normalized) {
+    if (seenQueueIds.has(notification.queueId)) {
+      throw new Error(
+        `Duplicate event notification queueId: ${notification.queueId}`,
+      );
+    }
+    seenQueueIds.add(notification.queueId);
+  }
+
+  normalized.sort((a, b) => a.queueId.localeCompare(b.queueId));
+  return normalized;
+}
+
 const _R2Bucket = Resource(
   "cloudflare::R2Bucket",
   async function (
@@ -639,6 +738,11 @@ const _R2Bucket = Resource(
       isDeployed: this.output?.dev?.isDeployed || !isLocal,
     } satisfies _R2Bucket["dev"];
     const adopt = props.adopt ?? this.scope.adopt;
+
+    const desiredEventNotifications =
+      props.eventNotifications !== undefined
+        ? normalizeR2BucketEventNotifications(props.eventNotifications)
+        : undefined;
 
     async function createDomains(domain: NonNullable<BucketProps["domains"]>) {
       return Promise.all(
@@ -679,6 +783,7 @@ const _R2Bucket = Resource(
         type: "r2_bucket",
         accountId: this.output?.accountId ?? "",
         cors: props.cors,
+        eventNotifications: desiredEventNotifications,
         dev,
       };
     }
@@ -729,6 +834,15 @@ const _R2Bucket = Resource(
       if (props.lock?.length) {
         await putBucketLockRules(api, bucketName, props);
       }
+      if (props.eventNotifications?.length) {
+        await syncBucketEventNotifications(
+          api,
+          bucketName,
+          props,
+          [],
+          desiredEventNotifications ?? [],
+        );
+      }
       let dataCatalog:
         | {
             id: string;
@@ -752,6 +866,7 @@ const _R2Bucket = Resource(
         lifecycle: props.lifecycle,
         lock: props.lock,
         cors: props.cors,
+        eventNotifications: desiredEventNotifications,
         dev,
         catalog: dataCatalog,
       };
@@ -788,6 +903,20 @@ const _R2Bucket = Resource(
       if (!isDeepStrictEqual(this.output.lock ?? [], props.lock ?? [])) {
         await putBucketLockRules(api, bucketName, props);
       }
+      if (
+        !isDeepStrictEqual(
+          this.output.eventNotifications ?? [],
+          desiredEventNotifications ?? [],
+        )
+      ) {
+        await syncBucketEventNotifications(
+          api,
+          bucketName,
+          props,
+          this.output.eventNotifications ?? [],
+          desiredEventNotifications ?? [],
+        );
+      }
       return {
         ...this.output,
         devDomain,
@@ -796,6 +925,7 @@ const _R2Bucket = Resource(
         cors: props.cors,
         lifecycle: props.lifecycle,
         lock: props.lock,
+        eventNotifications: desiredEventNotifications,
       };
     }
   },
@@ -1199,6 +1329,106 @@ export async function putBucketLockRules(
       { headers: withJurisdiction(props) },
     ),
   );
+}
+
+async function putBucketEventNotificationQueueRules(
+  api: CloudflareApi,
+  bucketName: string,
+  queueId: string,
+  rules: R2BucketEventNotificationRuleOptions[],
+  props: BucketProps,
+) {
+  await extractCloudflareResult(
+    `put R2 bucket event notifications for "${bucketName}" queue "${queueId}"`,
+    api.put(
+      `/accounts/${api.accountId}/event_notifications/r2/${bucketName}/configuration/queues/${queueId}`,
+      { rules },
+      { headers: withJurisdiction(props) },
+    ),
+  );
+}
+
+async function deleteBucketEventNotificationQueueRules(
+  api: CloudflareApi,
+  bucketName: string,
+  queueId: string,
+  props: BucketProps,
+) {
+  try {
+    await extractCloudflareResult(
+      `delete R2 bucket event notifications for "${bucketName}" queue "${queueId}"`,
+      api.delete(
+        `/accounts/${api.accountId}/event_notifications/r2/${bucketName}/configuration/queues/${queueId}`,
+        { headers: withJurisdiction(props) },
+      ),
+    );
+  } catch (error) {
+    if (error instanceof CloudflareApiError && error.status === 404) {
+      return;
+    }
+    throw error;
+  }
+}
+
+async function syncBucketEventNotifications(
+  api: CloudflareApi,
+  bucketName: string,
+  props: BucketProps,
+  previous: R2BucketEventNotification[],
+  desired: R2BucketEventNotification[],
+) {
+  const desiredByQueueId = new Map(
+    desired.map((notification) => [notification.queueId, notification]),
+  );
+  const previousByQueueId = new Map(
+    previous.map((notification) => [notification.queueId, notification]),
+  );
+
+  const tasks: Promise<void>[] = [];
+
+  for (const notification of desired) {
+    const prev = previousByQueueId.get(notification.queueId);
+    if (isDeepStrictEqual(prev?.rules ?? [], notification.rules)) {
+      continue;
+    }
+
+    if (notification.rules.length === 0) {
+      tasks.push(
+        deleteBucketEventNotificationQueueRules(
+          api,
+          bucketName,
+          notification.queueId,
+          props,
+        ),
+      );
+    } else {
+      tasks.push(
+        putBucketEventNotificationQueueRules(
+          api,
+          bucketName,
+          notification.queueId,
+          notification.rules,
+          props,
+        ),
+      );
+    }
+  }
+
+  for (const notification of previous) {
+    if (desiredByQueueId.has(notification.queueId)) {
+      continue;
+    }
+    tasks.push(
+      deleteBucketEventNotificationQueueRules(
+        api,
+        bucketName,
+        notification.queueId,
+        props,
+      ),
+    );
+  }
+
+  await Promise.all(tasks);
 }
 
 /**
