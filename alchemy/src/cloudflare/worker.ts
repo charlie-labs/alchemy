@@ -1777,7 +1777,9 @@ export async function deleteWorker(
         const message = err.message.toLowerCase();
         return (
           message.includes("delete worker") &&
-          (message.includes("is still referenced by service bindings in workers") ||
+          (message.includes(
+            "is still referenced by service bindings in workers",
+          ) ||
             (message.includes("queue") &&
               (message.includes("consumer") ||
                 message.includes("event source") ||
