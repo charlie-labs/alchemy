@@ -69,7 +69,7 @@ import { D1Database } from "alchemy/cloudflare";
 
 const db = await D1Database("my-db", {
   name: "my-db",
-  importDir: "./imports",
+  importFiles: ["./my-file.sql"],
 });
 ```
 

@@ -54,7 +54,11 @@ import {
   getWorkerSettings,
   prepareWorkerMetadata,
 } from "./worker-metadata.ts";
-import { WorkerSubdomain, disableWorkerSubdomain } from "./worker-subdomain.ts";
+import {
+  createWorkerUrl,
+  disableWorkerSubdomain,
+  enableWorkerSubdomain,
+} from "./worker-subdomain.ts";
 import { createTail } from "./worker-tail.ts";
 import {
   Workflow,
@@ -175,6 +179,14 @@ export interface BaseWorkerProps<
    * @default false
    */
   url?: boolean;
+
+  /**
+   * Whether to enable preview subdomains for this worker
+   *
+   * If true, the worker will be available at {name}-preview.{subdomain}.workers.dev
+   * @default false if durable objects are used, otherwise true
+   */
+  previewSubdomains?: boolean;
 
   /**
    * Specify the observability behavior of the Worker.
@@ -365,22 +377,16 @@ export interface BaseWorkerProps<
       };
 
   /**
-   * Smart placement configuration for the worker.
+   * Placement configuration for the worker.
    *
-   * Controls how Cloudflare places the worker across its network for optimal performance.
+   * Controls where your Worker runs to reduce latency to back-end infrastructure.
+   * Only one placement option can be specified (mutually exclusive).
    *
-   * When omitted, smart placement is disabled (default behavior).
+   * When omitted, the Worker runs in the data center closest to the incoming request.
+   *
+   * @see https://developers.cloudflare.com/workers/configuration/smart-placement/
    */
-  placement?: {
-    /**
-     * The placement mode for the worker.
-     *
-     * - "smart": Automatically optimize placement based on performance metrics
-     *
-     * @default undefined (smart placement disabled)
-     */
-    mode: "smart";
-  };
+  placement?: WorkerPlacement;
 
   limits?: {
     /**
@@ -475,6 +481,136 @@ export interface WorkerObservability {
      */
     destinations?: string[];
   };
+}
+
+/**
+ * Worker placement configuration for controlling where your Worker runs.
+ *
+ * Only one placement option can be specified at a time (mutually exclusive).
+ *
+ * @see https://developers.cloudflare.com/workers/configuration/smart-placement/
+ */
+export type WorkerPlacement =
+  | WorkerPlacementSmart
+  | WorkerPlacementRegion
+  | WorkerPlacementHost
+  | WorkerPlacementHostname;
+
+/**
+ * Smart placement mode - Cloudflare automatically places your Worker
+ * closest to the upstream with the most requests.
+ *
+ * Use when your Worker connects to multiple back-end services or you
+ * don't know the exact location of your infrastructure.
+ *
+ * @example
+ * ```ts
+ * const worker = await Worker("api", {
+ *   entrypoint: "./src/worker.ts",
+ *   placement: { mode: "smart" }
+ * });
+ * ```
+ */
+export interface WorkerPlacementSmart {
+  /**
+   * Enable smart placement mode.
+   *
+   * Cloudflare automatically analyzes your Worker's traffic patterns and
+   * places it in an optimal location based on performance metrics.
+   */
+  mode: "smart";
+}
+
+/**
+ * Region-based placement - place your Worker closest to a specific
+ * cloud provider region.
+ *
+ * Use when your back-end infrastructure runs in a known AWS, GCP, or Azure region.
+ *
+ * @example
+ * ```ts
+ * const worker = await Worker("api", {
+ *   entrypoint: "./src/worker.ts",
+ *   placement: { region: "aws:us-east-1" }
+ * });
+ * ```
+ */
+export interface WorkerPlacementRegion {
+  /**
+   * Cloud provider region to place your Worker closest to.
+   *
+   * Format: `{provider}:{region}`
+   *
+   * Supported providers:
+   * - AWS: `aws:us-east-1`, `aws:us-west-2`, `aws:eu-central-1`, etc.
+   * - GCP: `gcp:us-east4`, `gcp:europe-west1`, `gcp:asia-east1`, etc.
+   * - Azure: `azure:westeurope`, `azure:eastus`, `azure:southeastasia`, etc.
+   *
+   * @see https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-regions-availability-zones.html
+   * @see https://cloud.google.com/compute/docs/regions-zones
+   * @see https://learn.microsoft.com/en-us/azure/reliability/regions-list
+   *
+   * @example "aws:us-east-1"
+   * @example "gcp:us-east4"
+   * @example "azure:westeurope"
+   */
+  region: string;
+}
+
+/**
+ * Host-based placement (layer 4) - place your Worker closest to a specific
+ * TCP endpoint.
+ *
+ * Use when your infrastructure is not in a major cloud provider and you need
+ * to probe a TCP service (like a database) to determine optimal placement.
+ *
+ * @example
+ * ```ts
+ * const worker = await Worker("api", {
+ *   entrypoint: "./src/worker.ts",
+ *   placement: { host: "my-database.example.com:5432" }
+ * });
+ * ```
+ */
+export interface WorkerPlacementHost {
+  /**
+   * Host endpoint to probe (TCP/layer 4) for placement.
+   *
+   * Cloudflare uses TCP CONNECT checks to measure latency and selects
+   * the best data center. Use this for database hosts or other TCP services.
+   *
+   * Format: `hostname:port`
+   *
+   * @example "my_database_host.com:5432"
+   */
+  host: string;
+}
+
+/**
+ * Hostname-based placement (layer 7) - place your Worker closest to a specific
+ * HTTP endpoint.
+ *
+ * Use when your infrastructure is not in a major cloud provider and you need
+ * to probe an HTTP service (like an API) to determine optimal placement.
+ *
+ * @example
+ * ```ts
+ * const worker = await Worker("api", {
+ *   entrypoint: "./src/worker.ts",
+ *   placement: { hostname: "my-api.example.com" }
+ * });
+ * ```
+ */
+export interface WorkerPlacementHostname {
+  /**
+   * Hostname to probe (HTTP/layer 7) for placement.
+   *
+   * Cloudflare uses HTTP HEAD checks to measure latency and selects
+   * the best data center. Use this for API endpoints or other HTTP services.
+   *
+   * @example "my_api_server.com"
+   */
+  hostname: string;
 }
 
 export interface InlineWorkerProps<
@@ -630,11 +766,9 @@ export type Worker<
   version?: string;
 
   /**
-   * Smart placement configuration for the worker
+   * Placement configuration for the worker
    */
-  placement?: {
-    mode: "smart";
-  };
+  placement?: WorkerPlacement;
 
   /**
    * Whether the worker has a remote deployment
@@ -940,6 +1074,7 @@ const _Worker = Resource(
         durableObjects,
       };
     })();
+    const scriptName = options.name;
 
     if (this.phase === "delete") {
       // Heuristic: we must detect the case where this is the Worker wrapped in the old Website nested scope and not delete it
@@ -1020,6 +1155,7 @@ const _Worker = Resource(
           local: true,
           dispatchNamespace: options.dispatchNamespace,
           containers: options.containers,
+          hasDurableObjects: options.durableObjects.length > 0,
         },
       );
       return {
@@ -1102,6 +1238,7 @@ const _Worker = Resource(
           namespace: options.dispatchNamespace,
         })
       : undefined;
+
     let result: PutWorkerResult;
 
     if (this.scope.watch) {
@@ -1123,15 +1260,58 @@ const _Worker = Resource(
       });
       this.onCleanup(() => tail?.close());
     } else {
-      result = await putWorker(api, {
-        ...props,
-        workerName: options.name,
-        scriptBundle: await bundle.create(),
-        dispatchNamespace: options.dispatchNamespace,
-        compatibilityDate: options.compatibilityDate,
-        compatibilityFlags: options.compatibilityFlags,
-        assetUploadResult: assets,
-      });
+      // cloudflare has awkward sequencing requirements for modifying subdomains
+      // because conflicts with Durable Objects and preview_enabled is stateful
+      // to solve this, we try and do both in parallel and push them through
+      const bruteForce = <T>(operation: () => Promise<T>) =>
+        withExponentialBackoff(
+          operation,
+          (error) => {
+            operation;
+            return (
+              error instanceof CloudflareApiError &&
+              error.status === 400 &&
+              error.message.includes(
+                "Cannot use Durable Objects with Preview URLs",
+              )
+            );
+          },
+          10,
+          100,
+          1000,
+        );
+      const scriptBundle = await bundle.create();
+      const [_, _result] = await Promise.all([
+        bruteForce(updateSubdomain),
+        bruteForce(() =>
+          putWorker(api, {
+            ...props,
+            workerName: options.name,
+            scriptBundle,
+            dispatchNamespace: options.dispatchNamespace,
+            compatibilityDate: options.compatibilityDate,
+            compatibilityFlags: options.compatibilityFlags,
+            assetUploadResult: assets,
+          }),
+        ),
+      ]);
+      result = _result;
+    }
+
+    async function updateSubdomain() {
+      if (options.dispatchNamespace) {
+        return;
+      }
+      if (props.url === false) {
+        await disableWorkerSubdomain(api, scriptName);
+      } else {
+        const previewsEnabled = options.durableObjects.length === 0;
+        await enableWorkerSubdomain(
+          api,
+          scriptName,
+          props.previewSubdomains ?? previewsEnabled,
+        );
+      }
     }
 
     if (props.crons) {
@@ -1151,7 +1331,7 @@ const _Worker = Resource(
       ),
     );
 
-    const { domains, routes, subdomain } = await provisionResources(
+    const { domains, routes } = await provisionResources(
       {
         ...props,
         adopt,
@@ -1161,6 +1341,7 @@ const _Worker = Resource(
         local: false,
         dispatchNamespace: options.dispatchNamespace,
         containers: options.containers,
+        hasDurableObjects: options.durableObjects.length > 0,
         result,
         api,
       },
@@ -1183,7 +1364,14 @@ const _Worker = Resource(
       createdAt: this.output?.createdAt ?? now,
       updatedAt: now,
       eventSources: props.eventSources,
-      url: subdomain?.url,
+      url:
+        props.url !== false
+          ? await createWorkerUrl(
+              api,
+              scriptName,
+              props.version ? result?.id : undefined,
+            )
+          : undefined,
       assets: props.assets,
       crons: props.crons,
       tailConsumers: props.tailConsumers,
@@ -1237,27 +1425,31 @@ const assertUnique = <T, Key extends keyof T>(
   }
 };
 
+type ProvisionOptions =
+  | {
+      name: string;
+      local: true;
+      dispatchNamespace: string | undefined;
+      containers: Container[] | undefined;
+      hasDurableObjects: boolean;
+      result?: undefined;
+      api?: undefined;
+    }
+  | {
+      name: string;
+      local: false;
+      dispatchNamespace: string | undefined;
+      containers: Container[] | undefined;
+      hasDurableObjects: boolean;
+      result: PutWorkerResult;
+      api: CloudflareApi;
+    };
+
 async function provisionResources<B extends Bindings>(
   props: WorkerProps<B> & {
     adopt: boolean;
   },
-  options:
-    | {
-        name: string;
-        local: true;
-        dispatchNamespace: string | undefined;
-        containers: Container[] | undefined;
-        result?: undefined;
-        api?: undefined;
-      }
-    | {
-        name: string;
-        local: false;
-        dispatchNamespace: string | undefined;
-        containers: Container[] | undefined;
-        result: PutWorkerResult;
-        api: CloudflareApi;
-      },
+  options: ProvisionOptions,
 ) {
   let metadataPromise: ReturnType<typeof getVersionMetadata> | undefined;
 
@@ -1330,76 +1522,66 @@ async function provisionResources<B extends Bindings>(
     assertUnique(input.domains, "name", "Custom Domain");
   }
 
-  const [containers, domains, eventSources, routes, subdomain] =
-    await Promise.all([
-      input.containers
-        ? Promise.all(
-            input.containers.map(async (container) => {
-              return await ContainerApplication(container.id, {
-                ...container,
-                durableObjects: {
-                  namespaceId: await getContainerNamespaceId(container),
-                },
-                dev: options.local,
-                ...input.api,
-              });
-            }),
-          )
-        : undefined,
-      input.domains
-        ? Promise.all(
-            input.domains.map(async (domain) => {
-              return await CustomDomain(domain.name, {
-                name: domain.name,
-                zoneId: domain.zoneId,
-                adopt: domain.adopt,
-                workerName: options.name,
-                dev: options.local,
-                ...input.api,
-              });
-            }),
-          )
-        : undefined,
-      input.eventSources
-        ? Promise.all(
-            input.eventSources.map(async (eventSource) => {
-              return await QueueConsumer(`${eventSource.queue.id}-consumer`, {
-                queue: eventSource.queue,
-                scriptName: options.name,
-                settings: eventSource.settings,
-                adopt: props.adopt,
-                dev: options.local,
-                ...input.api,
-              });
-            }),
-          )
-        : undefined,
-      input.routes
-        ? Promise.all(
-            input.routes.map(async (route) => {
-              return await Route(route.pattern, {
-                pattern: route.pattern,
-                script: options.name,
-                zoneId: route.zoneId,
-                adopt: route.adopt,
-                dev: options.local,
-                ...input.api,
-              });
-            }),
-          )
-        : undefined,
-      (props.url ?? !options.dispatchNamespace)
-        ? WorkerSubdomain("url", {
-            scriptName: options.name,
-            previewVersionId: props.version ? options.result?.id : undefined,
-            retain: !!props.version,
-            dev: options.local,
-            ...input.api,
-          })
-        : undefined,
-    ]);
+  const [containers, domains, eventSources, routes] = await Promise.all([
+    input.containers
+      ? Promise.all(
+          input.containers.map(async (container) => {
+            return await ContainerApplication(container.id, {
+              ...container,
+              durableObjects: {
+                namespaceId: await getContainerNamespaceId(container),
+              },
+              dev: options.local,
+              ...input.api,
+            });
+          }),
+        )
+      : undefined,
+    input.domains
+      ? Promise.all(
+          input.domains.map(async (domain) => {
+            return await CustomDomain(domain.name, {
+              name: domain.name,
+              zoneId: domain.zoneId,
+              adopt: domain.adopt,
+              workerName: options.name,
+              dev: options.local,
+              ...input.api,
+            });
+          }),
+        )
+      : undefined,
+    input.eventSources
+      ? Promise.all(
+          input.eventSources.map(async (eventSource) => {
+            return await QueueConsumer(`${eventSource.queue.id}-consumer`, {
+              queue: eventSource.queue,
+              scriptName: options.name,
+              settings: eventSource.settings,
+              adopt: props.adopt,
+              dev: options.local,
+              ...input.api,
+            });
+          }),
+        )
+      : undefined,
+    input.routes
+      ? Promise.all(
+          input.routes.map(async (route) => {
+            return await Route(route.pattern, {
+              pattern: route.pattern,
+              script: options.name,
+              zoneId: route.zoneId,
+              adopt: route.adopt,
+              dev: options.local,
+              ...input.api,
+            });
+          }),
+        )
+      : undefined,
+  ]);
 
-  return { containers, domains, routes, eventSources, subdomain };
+  return { containers, domains, routes, eventSources };
 
   async function getContainerNamespaceId(container: Container) {
     if (options.local) {
@@ -1652,6 +1834,9 @@ export async function putWorker(
       (err instanceof CloudflareApiError &&
         err.status === 400 &&
         err.message.match(/binding.*failed to generate/)),
+    // (err.status === 400 &&
+    //   err.message.includes("100331") &&
+    //   err.message.includes("Cannot use Durable Objects with Preview URLs")),
     10,
     100,
   );
