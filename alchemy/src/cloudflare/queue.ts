@@ -2,6 +2,7 @@ import type { Context } from "../context.ts";
 import { Resource, ResourceKind } from "../resource.ts";
 import { Scope } from "../scope.ts";
 import { CloudflareApiError, handleApiError } from "./api-error.ts";
+import { withExponentialBackoff } from "../util/retry.ts";
 import {
   createCloudflareApi,
   type CloudflareApi,
@@ -423,24 +424,22 @@ export async function getQueue(
 /**
  * Delete a Cloudflare Queue
  */
-export async function deleteQueue(
-  api: CloudflareApi,
-  queueId: string,
-): Promise<void> {
-  // Delete Queue
-  const deleteResponse = await api.delete(
-    `/accounts/${api.accountId}/queues/${queueId}`,
+export async function deleteQueue(api: CloudflareApi, queueId: string): Promise<void> {
+  await withExponentialBackoff(
+    async () => {
+      const deleteResponse = await api.delete(`/accounts/${api.accountId}/queues/${queueId}`);
+      if (deleteResponse.status === 404) return;
+      if (!deleteResponse.ok) {
+        await handleApiError(deleteResponse, "delete", "queue", queueId);
+      }
+    },
+    (err) =>
+      (err.status === 400 && err.message.includes("still referenced by a binding in a Worker")) ||
+      err.status === 500 ||
+      err.status === 503,
+    10,
+    100,
   );
-
-  if (!deleteResponse.ok && deleteResponse.status !== 404) {
-    const errorData: any = await deleteResponse.json().catch(() => ({
-      errors: [{ message: deleteResponse.statusText }],
-    }));
-    throw new CloudflareApiError(
-      `Error deleting Cloudflare Queue '${queueId}': ${errorData.errors?.[0]?.message || deleteResponse.statusText}`,
-      deleteResponse,
-    );
-  }
 }
 
 /**
