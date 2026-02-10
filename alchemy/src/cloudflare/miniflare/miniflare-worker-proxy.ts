@@ -197,7 +197,7 @@ const writeMiniflareResponseToNode = (
     // responding to traffic from cloudflared: net/http: HTTP/1.x transport connection broken: too many
     // transfer encodings: [\"chunked\" \"chunked\"]"
     if (key !== "transfer-encoding") {
-      out.setHeader(key, value);
+      out.appendHeader(key, value);
     }
   });
 
