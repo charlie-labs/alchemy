@@ -1936,6 +1936,8 @@ export async function deleteWorker(
 ) {
   await withExponentialBackoff(
     async () => {
+      await deleteQueueConsumers(api, props.scriptName);
+
       const deleteResponse = await api.delete(
         props.dispatchNamespace
           ? `/accounts/${api.accountId}/workers/dispatch/namespaces/${props.dispatchNamespace}/scripts/${props.scriptName}?force=true`
@@ -1951,13 +1953,28 @@ export async function deleteWorker(
         );
       }
     },
-    (err) =>
-      (err.status === 400 &&
-        err.message.includes(
-          "is still referenced by service bindings in Workers",
-        )) ||
-      err.status === 500 ||
-      err.status === 503,
+    (err) => {
+      if (!(err instanceof CloudflareApiError)) {
+        return false;
+      }
+
+      if (err.status === 400 || err.status === 409) {
+        const message = err.message.toLowerCase();
+        return (
+          message.includes("delete worker") &&
+          (message.includes(
+            "is still referenced by service bindings in workers",
+          ) ||
+            (message.includes("queue") &&
+              (message.includes("consumer") ||
+                message.includes("event source") ||
+                message.includes("eventsource") ||
+                message.includes("trigger"))))
+        );
+      }
+
+      return err.status === 500 || err.status === 503;
+    },
     10,
     100,
   );

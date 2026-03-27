@@ -1,12 +1,14 @@
 import type { Context } from "../context.ts";
 import { Resource, ResourceKind } from "../resource.ts";
 import { Scope } from "../scope.ts";
+import { withExponentialBackoff } from "../util/retry.ts";
 import { CloudflareApiError, handleApiError } from "./api-error.ts";
 import {
   createCloudflareApi,
   type CloudflareApi,
   type CloudflareApiOptions,
 } from "./api.ts";
+import { deleteQueueConsumer, listQueueConsumers } from "./queue-consumer.ts";
 
 /**
  * Settings for a Cloudflare Queue
@@ -427,20 +429,54 @@ export async function deleteQueue(
   api: CloudflareApi,
   queueId: string,
 ): Promise<void> {
-  // Delete Queue
-  const deleteResponse = await api.delete(
-    `/accounts/${api.accountId}/queues/${queueId}`,
-  );
+  await withExponentialBackoff(
+    async () => {
+      const consumers = await listQueueConsumers(api, queueId);
+      await Promise.all(
+        consumers.map((consumer) =>
+          deleteQueueConsumer(api, queueId, consumer.id),
+        ),
+      );
 
-  if (!deleteResponse.ok && deleteResponse.status !== 404) {
-    const errorData: any = await deleteResponse.json().catch(() => ({
-      errors: [{ message: deleteResponse.statusText }],
-    }));
-    throw new CloudflareApiError(
-      `Error deleting Cloudflare Queue '${queueId}': ${errorData.errors?.[0]?.message || deleteResponse.statusText}`,
-      deleteResponse,
-    );
-  }
+      const deleteResponse = await api.delete(
+        `/accounts/${api.accountId}/queues/${queueId}`,
+      );
+
+      if (deleteResponse.status === 404) {
+        return;
+      }
+
+      if (!deleteResponse.ok) {
+        const errorData: any = await deleteResponse.json().catch(() => ({
+          errors: [{ message: deleteResponse.statusText }],
+        }));
+        throw new CloudflareApiError(
+          `Error deleting Cloudflare Queue '${queueId}': ${errorData.errors?.[0]?.message || deleteResponse.statusText}`,
+          deleteResponse,
+        );
+      }
+    },
+    (err) => {
+      if (!(err instanceof CloudflareApiError)) {
+        return false;
+      }
+
+      if (err.status === 400 || err.status === 409) {
+        const message = err.message.toLowerCase();
+        return (
+          message.includes("deleting cloudflare queue") &&
+          (message.includes("consumer") ||
+            message.includes("event source") ||
+            message.includes("eventsource") ||
+            message.includes("trigger"))
+        );
+      }
+
+      return false;
+    },
+    10,
+    100,
+  );
 }
 
 /**

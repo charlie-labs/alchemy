@@ -455,6 +455,10 @@ export async function listQueueConsumers(
     `/accounts/${api.accountId}/queues/${queueId}/consumers`,
   );
 
+  if (response.status === 404) {
+    return [];
+  }
+
   if (!response.ok) {
     throw new CloudflareApiError(
       `Failed to list queue consumers: ${response.statusText}`,
@@ -525,7 +529,7 @@ export async function listQueueConsumersForWorker(
   workerName: string,
 ) {
   const response = await api.get(
-    `/accounts/${api.accountId}/workers/scripts/${workerName}/queue-consumers?perPage=100`,
+    `/accounts/${api.accountId}/workers/scripts/${workerName}/queue-consumers?per_page=100`,
   );
 
   if (response.status === 404) {
